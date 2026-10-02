@@ -17,6 +17,7 @@ laptop.
 | [`skill-authoring/SKILL.md`](skill-authoring/SKILL.md) | The guide: runnable skills vs references, every frontmatter field (`writes` budget, `judge`, `checks`, `requires`, `reads`, `mustProduce`, `inference`, provenance), how to write the body, and a checklist |
 | [`skill-authoring/REFERENCE.md`](skill-authoring/REFERENCE.md) | Complete skeleton files to start from |
 | [`examples/`](examples) | Real skills from the network's catalog, copied as they are |
+| [`build-chat-bot/`](build-chat-bot) | A new skill written with the guide, plus `build-chat-bot/example/` — a small worked example of what it produces |
 | [`check-skill.mjs`](check-skill.mjs) | The catalog's own validation rules, runnable on your file. Node 18+, no dependencies |
 
 The examples cover the main shapes:
@@ -71,6 +72,23 @@ The guide is the same file the network ships in its catalog, so it names paths i
 repository — `skills/README.md`, `scripts/generate-skills.mjs`, `pnpm skills:generate`,
 `packages/daemon/src/task/prompt.ts`. You do not need them to write a skill; `check-skill.mjs` applies
 the same rules. Paths under `.imd/reads/` are where a worker finds its pinned inputs during a run.
+
+## A skill written with the guide: build-chat-bot
+
+`build-chat-bot/SKILL.md` is a runnable `implement` skill: it asks the worker to build
+a small self-hosted Telegram or Discord bot in TypeScript — commands from the request,
+secrets only from env, inbound rate limiting, a local test harness that needs no live
+token, and deploy notes for a small VPS or container. It is `checks: none` +
+`verifier-paths`, because no verifier suite installs npm packages and runs a
+TypeScript harness.
+
+`build-chat-bot/example/` is a worked example of its output: a zero-dependency
+Telegram bot whose harness runs under `node --test` with no token and no network.
+It is labelled, everywhere it presents itself (its README top, its CLI `--help`, and
+the status page it serves):
+
+> Experimental, commissioned as a test of the IMD swarm. It may not work as
+> described. Read the code, start with small amounts, no warranty.
 
 ## Proposing a skill for the network
 
