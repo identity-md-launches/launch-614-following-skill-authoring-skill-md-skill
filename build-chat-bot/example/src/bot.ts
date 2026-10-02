@@ -16,9 +16,14 @@ export class Bot {
   /** One polling round. Returns the offset to pass next so updates are not
    *  reprocessed after a restart or retry. */
   async poll(offset: number): Promise<number> {
+    const replies: Promise<void>[] = [];
     for (const update of await this.transport.getUpdates(offset)) {
       offset = Math.max(offset, update.update_id + 1);
-      await this.handle(update);
+      replies.push(this.handle(update));
+    }
+    const results = await Promise.allSettled(replies);
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
     }
     return offset;
   }

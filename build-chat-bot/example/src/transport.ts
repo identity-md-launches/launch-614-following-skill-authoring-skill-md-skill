@@ -21,10 +21,10 @@ const systemClock: Clock = {
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-/** Reserve outbound send times before waiting, so concurrent callers share the
- *  same per-chat and overall limits. */
+/** Queue sends per chat; claim an overall slot only when that chat is ready. */
 class OutboundPacer {
   private nextByChat = new Map<number, number>();
+  private queues = new Map<number, Promise<void>>();
   private nextOverall = 0;
   private clock: Clock;
 
@@ -32,12 +32,33 @@ class OutboundPacer {
     this.clock = clock;
   }
 
-  async wait(chatId: number): Promise<void> {
-    const now = this.clock.now();
-    const sendAt = Math.max(now, this.nextByChat.get(chatId) ?? 0, this.nextOverall);
-    this.nextByChat.set(chatId, sendAt + 1_000);
-    this.nextOverall = sendAt + 1_000 / 30;
-    if (sendAt > now) await this.clock.sleep(sendAt - now);
+  send(chatId: number, send: () => Promise<void>): Promise<void> {
+    const previous = this.queues.get(chatId) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(async () => {
+      await this.wait(chatId);
+      await send();
+    });
+    this.queues.set(chatId, pending);
+    return pending.finally(() => {
+      if (this.queues.get(chatId) === pending) this.queues.delete(chatId);
+    });
+  }
+
+  private async wait(chatId: number): Promise<void> {
+    for (;;) {
+      const now = this.clock.now();
+      for (const [id, next] of this.nextByChat) {
+        if (next <= now) this.nextByChat.delete(id);
+      }
+      const sendAt = Math.max(now, this.nextByChat.get(chatId) ?? 0, this.nextOverall);
+      if (sendAt > now) {
+        await this.clock.sleep(sendAt - now);
+        continue;
+      }
+      this.nextByChat.set(chatId, now + 1_000);
+      this.nextOverall = now + 1_000 / 30;
+      return;
+    }
   }
 }
 
@@ -75,8 +96,9 @@ export class TelegramTransport implements Transport {
   }
 
   async sendMessage(chatId: number, text: string): Promise<void> {
-    await this.pacer.wait(chatId);
-    await this.call("sendMessage", { chat_id: chatId, text });
+    await this.pacer.send(chatId, async () => {
+      await this.call("sendMessage", { chat_id: chatId, text });
+    });
   }
 }
 
@@ -99,7 +121,8 @@ export class ScriptedTransport implements Transport {
   }
 
   async sendMessage(chatId: number, text: string): Promise<void> {
-    await this.pacer.wait(chatId);
-    this.sent.push({ chatId, text });
+    await this.pacer.send(chatId, async () => {
+      this.sent.push({ chatId, text });
+    });
   }
 }

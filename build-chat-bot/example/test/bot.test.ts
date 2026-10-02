@@ -5,7 +5,7 @@ import { Bot } from "../src/bot.ts";
 import { commands, NOTICE } from "../src/commands.ts";
 import { loadConfig } from "../src/config.ts";
 import { RateLimiter } from "../src/ratelimit.ts";
-import { ScriptedTransport } from "../src/transport.ts";
+import { ScriptedTransport, TelegramTransport } from "../src/transport.ts";
 import type { Clock } from "../src/transport.ts";
 import type { Update } from "../src/transport.ts";
 
@@ -126,4 +126,93 @@ test("config fails fast without a token and reads values only from env", () => {
   const config = loadConfig({ TELEGRAM_BOT_TOKEN: "test-token", ALLOWED_CHAT_IDS: "1, 2" });
   assert.equal(config.token, "test-token");
   assert.deepEqual([...config.allowedChatIds], [1, 2]);
+});
+
+/** Sleep stays pending until the test advances time, like a real timer. */
+class ManualClock implements Clock {
+  time = 0;
+  private timers: { at: number; resolve: () => void }[] = [];
+  now = () => this.time;
+
+  sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => this.timers.push({ at: this.time + ms, resolve }));
+  }
+
+  async advance(ms: number): Promise<void> {
+    this.time += ms;
+    const ready = this.timers.filter((timer) => timer.at <= this.time);
+    this.timers = this.timers.filter((timer) => timer.at > this.time);
+    for (const timer of ready) timer.resolve();
+    // Drain the queue and transport promise continuations without real sleeps.
+    for (let i = 0; i < 30; i += 1) await Promise.resolve();
+  }
+}
+
+test("the outbound pacer evicts expired chat times", async () => {
+  const clock = new FakeClock();
+  const transport = new ScriptedTransport([], clock);
+  for (let chatId = 0; chatId < 1_000; chatId += 1) {
+    await transport.sendMessage(chatId, "message");
+  }
+  const pacer = (transport as unknown as {
+    pacer: { nextByChat: Map<number, number>; queues: Map<number, Promise<void>> };
+  }).pacer;
+  assert.ok(pacer.nextByChat.size <= 31);
+  clock.time += 1_000;
+  await transport.sendMessage(1_000, "current");
+  assert.equal(pacer.nextByChat.size, 1);
+  assert.equal(pacer.queues.size, 0);
+});
+
+test("a polling batch queues chat A without holding up chat B", async () => {
+  const clock = new ManualClock();
+  const transport = new ScriptedTransport([
+    update(1, "/echo first", 1),
+    update(2, "/echo second", 1),
+    update(3, "/echo other", 2),
+  ], clock);
+  const bot = new Bot(transport, new RateLimiter(5, 60_000, clock.now), new Set());
+  const polling = bot.poll(0);
+  await clock.advance(0);
+  assert.deepEqual(transport.sent, [{ chatId: 1, text: "first" }]);
+  await clock.advance(34);
+  assert.deepEqual(transport.sent, [
+    { chatId: 1, text: "first" }, { chatId: 2, text: "other" },
+  ]);
+  await clock.advance(966);
+  assert.equal(await polling, 4);
+  assert.deepEqual(transport.sent[2], { chatId: 1, text: "second" });
+});
+
+test("TelegramTransport paces actual fetch calls per chat and overall", async (t) => {
+  const clock = new ManualClock();
+  const sent: { chatId: number; text: string; at: number }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    assert.ok(url.endsWith("/sendMessage"));
+    const body = JSON.parse(init.body as string);
+    sent.push({ chatId: body.chat_id, text: body.text, at: clock.now() });
+    return { ok: true, json: async () => ({ ok: true, result: {} }) };
+  });
+  const transport = new TelegramTransport("test-token", clock);
+  const sends = [transport.sendMessage(1, "first"), transport.sendMessage(1, "second")];
+  for (let chatId = 2; chatId <= 31; chatId += 1) {
+    sends.push(transport.sendMessage(chatId, "other"));
+  }
+  await clock.advance(0);
+  assert.equal(sent.length, 1);
+  await clock.advance(34);
+  assert.equal(sent[1].chatId, 2);
+  assert.equal(sent[1].at, 34);
+  for (let i = 0; i < 30; i += 1) await clock.advance(34);
+  await Promise.all(sends);
+  assert.equal(sent.length, 32);
+  const sameChat = sent.filter((message) => message.chatId === 1);
+  assert.deepEqual(sameChat.map((message) => message.text), ["first", "second"]);
+  assert.ok(sameChat[1].at - sameChat[0].at >= 1_000);
+  for (let i = 1; i < sent.length; i += 1) {
+    assert.ok(sent[i].at - sent[i - 1].at >= 1_000 / 30);
+  }
+  for (const message of sent) {
+    assert.ok(sent.filter((other) => other.at >= message.at && other.at < message.at + 1_000).length <= 30);
+  }
 });
