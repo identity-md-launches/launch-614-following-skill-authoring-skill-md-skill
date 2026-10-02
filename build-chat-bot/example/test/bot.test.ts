@@ -6,6 +6,7 @@ import { commands, NOTICE } from "../src/commands.ts";
 import { loadConfig } from "../src/config.ts";
 import { RateLimiter } from "../src/ratelimit.ts";
 import { ScriptedTransport } from "../src/transport.ts";
+import type { Clock } from "../src/transport.ts";
 import type { Update } from "../src/transport.ts";
 
 function update(id: number, text: string, chatId = 42): Update {
@@ -13,10 +14,22 @@ function update(id: number, text: string, chatId = 42): Update {
 }
 
 function makeBot(updates: Update[], limit = 5, allowed: Set<number> = new Set()) {
-  const transport = new ScriptedTransport(updates);
-  let now = 0;
-  const bot = new Bot(transport, new RateLimiter(limit, 60_000, () => now), allowed);
-  return { bot, transport, tick: (ms: number) => (now += ms) };
+  const clock = new FakeClock();
+  const transport = new ScriptedTransport(updates, clock);
+  const bot = new Bot(transport, new RateLimiter(limit, 60_000, clock.now), allowed);
+  return { bot, transport, tick: (ms: number) => (clock.time += ms) };
+}
+
+class FakeClock implements Clock {
+  time = 0;
+  readonly sleeps: number[] = [];
+
+  now = () => this.time;
+
+  async sleep(ms: number): Promise<void> {
+    this.sleeps.push(ms);
+    this.time += ms;
+  }
 }
 
 test("every command gets a reply", async () => {
@@ -66,6 +79,38 @@ test("the limiter resets after the window passes", async () => {
     transport.sent.map((m) => m.text),
     ["pong", "pong", "Rate limit reached — try again in a minute.", "pong"],
   );
+});
+
+test("the limiter evicts expired chat slots", () => {
+  let now = 0;
+  const limiter = new RateLimiter(1, 1_000, () => now);
+  limiter.check("old-one");
+  limiter.check("old-two");
+  now = 1_000;
+  limiter.check("current");
+  assert.equal((limiter as unknown as { slots: Map<string, unknown> }).slots.size, 1);
+});
+
+test("outbound messages to one chat wait one second", async () => {
+  const clock = new FakeClock();
+  const transport = new ScriptedTransport([], clock);
+  await transport.sendMessage(42, "first");
+  await transport.sendMessage(42, "second");
+  assert.deepEqual(clock.sleeps, [1_000]);
+  assert.equal(clock.time, 1_000);
+});
+
+test("more than thirty outbound messages are spread across a second", async () => {
+  const clock = new FakeClock();
+  const transport = new ScriptedTransport([], clock);
+  const sentAt: number[] = [];
+  for (let chatId = 0; chatId < 31; chatId += 1) {
+    await transport.sendMessage(chatId, "message");
+    sentAt.push(clock.time);
+  }
+  assert.equal(transport.sent.length, 31);
+  assert.equal(sentAt.filter((time) => time < 1_000).length, 30);
+  assert.ok(sentAt[30] >= 1_000);
 });
 
 test("a chat outside the allowlist gets nothing", async () => {

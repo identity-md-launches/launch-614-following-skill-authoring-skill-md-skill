@@ -25,6 +25,9 @@ export class RateLimiter {
 
   check(key: string): LimitVerdict {
     const t = this.now();
+    for (const [expiredKey, slot] of this.slots) {
+      if (t >= slot.resetAt) this.slots.delete(expiredKey);
+    }
     let slot = this.slots.get(key);
     if (!slot || t >= slot.resetAt) {
       slot = { count: 0, resetAt: t + this.windowMs, notified: false };
